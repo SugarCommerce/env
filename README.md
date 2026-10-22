@@ -84,7 +84,7 @@ and read as configured-but-blank.
 export FOO=bar                  # `export` prefix, from copying out of a shell
 PORT=8080 # the http port       # trailing comment, only after whitespace
 PASSWORD=abc#def                # but not one inside a value
-QUOTED="a b c"                  # quotes stripped
+QUOTED="a b c" # rotated monthly # quotes stripped, comment after them ignored
 LITERAL='no \n escapes'         # single quotes are literal
 ESCAPED="line one\nline two"    # double quotes expand escapes
 KEY="-----BEGIN-----
@@ -94,7 +94,17 @@ lines
 ```
 
 Anything it cannot use — a name with a dash, a line with no `=` — is skipped
-rather than guessed at.
+rather than guessed at. A quote that never closes is part of the value, not
+the start of one that swallows the rest of the file. Nothing is expanded:
+`$HOME` and `${OTHER}` are literal text.
+
+## Keeping secrets secret
+
+`var_dump()` and `print_r()` of an `Env` show the key names and never the
+values, and the values are marked `#[\SensitiveParameter]` so they stay out of
+stack traces. A name starting `HTTP_` is read from the process environment
+only: under CGI and FastCGI a request header arrives as an `HTTP_*` variable,
+and would otherwise be able to set it.
 
 ## Testing
 
@@ -110,7 +120,7 @@ PHP 8.5+. No extensions, no dependencies.
 
 ## Tests
 
-35 tests covering the parser cases above, precedence, and every accessor.
+52 tests covering the parser cases above, precedence, and every accessor.
 
 ```bash
 composer test

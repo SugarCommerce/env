@@ -42,11 +42,13 @@ final class Env {
 	private array $values;
 
 	/**
+	 * Hold a set of values; the real environment still wins over them.
+	 *
 	 * @since 1.0.0
 	 *
 	 * @param array<string, string> $values Key-value pairs.
 	 */
-	public function __construct( array $values = array() ) {
+	public function __construct( #[\SensitiveParameter] array $values = array() ) {
 		$this->values = $values;
 	}
 
@@ -63,7 +65,7 @@ final class Env {
 	 * @return self
 	 */
 	public static function load( string $path ): self {
-		$values = is_readable( $path )
+		$values = is_file( $path ) && is_readable( $path )
 			? Parser::parse( (string) file_get_contents( $path ) )
 			: array();
 
@@ -81,7 +83,7 @@ final class Env {
 	 *
 	 * @return self
 	 */
-	public static function from_array( array $values ): self {
+	public static function from_array( #[\SensitiveParameter] array $values ): self {
 		return new self( $values );
 	}
 
@@ -114,8 +116,10 @@ final class Env {
 	/**
 	 * An integer.
 	 *
-	 * A non-numeric value is the default rather than zero: `PORT=eighty`
-	 * silently becoming 0 is worse than it being ignored.
+	 * Only whole numbers count. Anything else is the default rather than a
+	 * guess: `PORT=eighty` silently becoming 0, `LIMIT=2.9` becoming 2,
+	 * `LIMIT=1e3` becoming 1000 or a number too big for an int saturating
+	 * to PHP_INT_MAX are all worse than the value being ignored.
 	 *
 	 * @since 1.0.0
 	 *
@@ -129,7 +133,9 @@ final class Env {
 	public function int( string $key, ?int $default = null ): int {
 		$value = $this->raw( $key );
 
-		if ( null === $value || ! is_numeric( $value ) ) {
+		$int = null === $value ? null : self::whole_number( $value );
+
+		if ( null === $int ) {
 			if ( null === $default ) {
 				throw new MissingValue( $key );
 			}
@@ -137,7 +143,7 @@ final class Env {
 			return $default;
 		}
 
-		return (int) $value;
+		return $int;
 	}
 
 	/**
@@ -187,7 +193,12 @@ final class Env {
 			return $default;
 		}
 
-		return array_values( array_filter( array_map( 'trim', explode( ',', $value ) ), 'strlen' ) );
+		return array_values(
+			array_filter(
+				array_map( trim( ... ), explode( ',', $value ) ),
+				static fn( string $entry ): bool => '' !== $entry
+			)
+		);
 	}
 
 	/**
@@ -258,7 +269,26 @@ final class Env {
 	}
 
 	/**
+	 * What var_dump() and print_r() show: the names, never the values.
+	 *
+	 * The instance holds every secret the application has, and a debug dump
+	 * of an object that holds it is exactly how one ends up in a log.
+	 *
+	 * @since 1.1.0
+	 *
+	 * @return array{keys: list<string>}
+	 */
+	public function __debugInfo(): array {
+		return array( 'keys' => array_keys( $this->values ) );
+	}
+
+	/**
 	 * The raw value, preferring the real environment over the file.
+	 *
+	 * A name starting `HTTP_` is read from the process environment only.
+	 * Under CGI and FastCGI every request header arrives as an `HTTP_*`
+	 * variable, so `Proxy: evil.example` in a request would otherwise become
+	 * the value of `HTTP_PROXY` — the "httpoxy" attack.
 	 *
 	 * @since 1.0.0
 	 *
@@ -267,7 +297,7 @@ final class Env {
 	 * @return string|null Null when absent or empty.
 	 */
 	private function raw( string $key ): ?string {
-		$live = getenv( $key );
+		$live = getenv( $key, str_starts_with( strtoupper( $key ), 'HTTP_' ) );
 
 		if ( false !== $live && '' !== $live ) {
 			return $live;
@@ -276,5 +306,24 @@ final class Env {
 		$value = $this->values[ $key ] ?? '';
 
 		return '' === $value ? null : $value;
+	}
+
+	/**
+	 * Read a whole number, or nothing.
+	 *
+	 * @since 1.1.0
+	 *
+	 * @param string $value Raw value.
+	 *
+	 * @return int|null Null when it is not a whole number that fits in an int.
+	 */
+	private static function whole_number( string $value ): ?int {
+		if ( 1 !== preg_match( '/^([+-]?)0*([0-9]+)$/D', trim( $value ), $parts ) ) {
+			return null;
+		}
+
+		$int = filter_var( $parts[1] . $parts[2], FILTER_VALIDATE_INT );
+
+		return false === $int ? null : $int;
 	}
 }

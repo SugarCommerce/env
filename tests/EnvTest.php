@@ -87,6 +87,58 @@ final class EnvTest extends TestCase {
 		$this->assertSame( 'one\ntwo', $values['B'] );
 	}
 
+	/**
+	 * A comment after a quoted value must end the value there. It used to
+	 * leave the quote looking unclosed, so every key after it was swallowed
+	 * into the secret — `DEBUG=false` silently gone.
+	 */
+	public function test_a_comment_after_a_quoted_value_does_not_swallow_the_file(): void {
+		$values = Parser::parse( "SECRET=\"a b\" # rotated monthly\nDEBUG=false\nNAME='c' # note\nLAST=1" );
+
+		$this->assertSame( array( 'SECRET' => 'a b', 'DEBUG' => 'false', 'NAME' => 'c', 'LAST' => '1' ), $values );
+	}
+
+	/**
+	 * A quote that never closes is the first character of the value, not
+	 * the start of one that runs to the end of the file.
+	 */
+	public function test_an_unclosed_quote_is_a_literal_and_does_not_swallow_the_file(): void {
+		$values = Parser::parse( "PASS=\"abc\nDEBUG=false" );
+
+		$this->assertSame( array( 'PASS' => '"abc', 'DEBUG' => 'false' ), $values );
+	}
+
+	/**
+	 * `\\"` is an escaped backslash and then the closing quote.
+	 */
+	public function test_an_escaped_backslash_before_the_closing_quote_closes_it(): void {
+		$values = Parser::parse( "PATH_ROOT=\"C:\\\\\"\nNEXT=1" );
+
+		$this->assertSame( array( 'PATH_ROOT' => 'C:\\', 'NEXT' => '1' ), $values );
+	}
+
+	/**
+	 * Escapes are expanded in one pass: `\\n` is a backslash and an `n`.
+	 */
+	public function test_an_escaped_backslash_is_not_read_as_a_newline(): void {
+		$this->assertSame( 'C:\\new', Parser::parse( 'P="C:\\\\new"' )['P'] );
+	}
+
+	public function test_an_escaped_quote_does_not_close_the_value(): void {
+		$this->assertSame( 'say "hi"', Parser::parse( 'Q="say \\"hi\\""' )['Q'] );
+	}
+
+	/**
+	 * Nothing is expanded, so a value cannot pull in another secret.
+	 */
+	public function test_variables_are_not_expanded(): void {
+		$this->assertSame( '${HOME}/$USER', Parser::parse( 'X="${HOME}/$USER"' )['X'] );
+	}
+
+	public function test_a_byte_order_mark_does_not_lose_the_first_key(): void {
+		$this->assertSame( array( 'FIRST' => '1' ), Parser::parse( "\xEF\xBB\xBFFIRST=1" ) );
+	}
+
 	#[DataProvider( 'malformed_lines' )]
 	public function test_it_skips_what_it_cannot_use( string $line ): void {
 		$this->assertSame( array(), Parser::parse( $line ) );
@@ -102,6 +154,7 @@ final class EnvTest extends TestCase {
 			'has a dash'     => array( 'FOO-BAR=baz' ),
 			'has a space'    => array( 'FOO BAR=baz' ),
 			'empty'          => array( '' ),
+			'newline in key' => array( "FOO\n=bar" ),
 		);
 	}
 
@@ -170,6 +223,71 @@ final class EnvTest extends TestCase {
 	 */
 	public function test_a_non_numeric_integer_is_the_default_not_zero(): void {
 		$this->assertSame( 3000, Env::from_array( array( 'PORT' => 'eighty' ) )->int( 'PORT', 3000 ) );
+	}
+
+	/**
+	 * Only whole numbers: a guess is worse than the default.
+	 */
+	#[DataProvider( 'not_whole_numbers' )]
+	public function test_anything_but_a_whole_number_is_the_default( string $written ): void {
+		$this->assertSame( 3000, Env::from_array( array( 'PORT' => $written ) )->int( 'PORT', 3000 ) );
+	}
+
+	/**
+	 * @return array<string, array{0: string}>
+	 */
+	public static function not_whole_numbers(): array {
+		return array(
+			'fraction'    => array( '2.9' ),
+			'exponent'    => array( '1e3' ),
+			'hex'         => array( '0x1F' ),
+			'overflowing' => array( '99999999999999999999' ),
+			'trailing'    => array( "80\n" . 'x' ),
+		);
+	}
+
+	public function test_signed_and_zero_padded_integers(): void {
+		$env = Env::from_array( array( 'A' => '-5', 'B' => '+7', 'C' => '0080', 'D' => '0' ) );
+
+		$this->assertSame( -5, $env->int( 'A' ) );
+		$this->assertSame( 7, $env->int( 'B' ) );
+		$this->assertSame( 80, $env->int( 'C' ) );
+		$this->assertSame( 0, $env->int( 'D' ) );
+	}
+
+	/**
+	 * A debug dump of the instance must not print every secret it holds.
+	 */
+	public function test_a_dump_shows_names_but_never_values(): void {
+		$env = Env::from_array( array( 'TOKEN_SECRET' => 'sk_live_do_not_print' ) );
+
+		$dump = print_r( $env, true );
+
+		$this->assertStringContainsString( 'TOKEN_SECRET', $dump );
+		$this->assertStringNotContainsString( 'sk_live_do_not_print', $dump );
+	}
+
+	/**
+	 * Secrets handed to the constructor must not appear in a stack trace.
+	 */
+	public function test_values_are_hidden_from_stack_traces(): void {
+		$parameters = ( new \ReflectionMethod( Env::class, 'from_array' ) )->getParameters();
+
+		$this->assertNotEmpty( $parameters[0]->getAttributes( \SensitiveParameter::class ) );
+	}
+
+	/**
+	 * An `HTTP_*` name is read from the process environment only — under
+	 * FastCGI a request header would otherwise set it (httpoxy).
+	 */
+	public function test_an_http_prefixed_key_still_reads_the_process_environment(): void {
+		putenv( 'HTTP_TEST_PROXY=from-process' );
+
+		try {
+			$this->assertSame( 'from-process', Env::from_array( array() )->string( 'HTTP_TEST_PROXY' ) );
+		} finally {
+			putenv( 'HTTP_TEST_PROXY' );
+		}
 	}
 
 	#[DataProvider( 'booleans' )]

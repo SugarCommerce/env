@@ -1,6 +1,6 @@
 {
   "name": "sugarcommerce/env",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Environment configuration for plain PHP: .env parsing that handles quotes and multi-line values, typed accessors that fail loudly on a missing requirement, and no global mutation. Zero dependencies.",
   "type": "library",
   "license": "GPL-2.0-or-later",

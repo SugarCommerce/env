@@ -36,7 +36,37 @@ namespace SugarCommerce\Env;
 final class Parser {
 
 	/**
+	 * The byte-order mark some editors put at the start of a UTF-8 file.
+	 *
+	 * @since 1.1.0
+	 *
+	 * @var string
+	 */
+	private const string BOM = "\xEF\xBB\xBF";
+
+	/**
+	 * The escapes a double-quoted value understands, and what each becomes.
+	 *
+	 * Applied in a single pass, so `\\n` is a backslash followed by `n` and
+	 * not a backslash followed by a newline.
+	 *
+	 * @since 1.1.0
+	 *
+	 * @var array<string, string>
+	 */
+	private const array ESCAPES = array(
+		'\\n'  => "\n",
+		'\\r'  => "\r",
+		'\\t'  => "\t",
+		'\\"'  => '"',
+		'\\\\' => '\\',
+	);
+
+	/**
 	 * Parse the contents of a .env file.
+	 *
+	 * Nothing is expanded: `$OTHER` and `${OTHER}` are literal text, so a
+	 * value can never pull in another secret or the server's environment.
 	 *
 	 * @since 1.0.0
 	 *
@@ -44,7 +74,11 @@ final class Parser {
 	 *
 	 * @return array<string, string> Keys in file order.
 	 */
-	public static function parse( string $contents ): array {
+	public static function parse( #[\SensitiveParameter] string $contents ): array {
+		if ( str_starts_with( $contents, self::BOM ) ) {
+			$contents = substr( $contents, strlen( self::BOM ) );
+		}
+
 		$values = array();
 		$lines  = preg_split( '/\R/', $contents ) ?: array();
 		$total  = count( $lines );
@@ -69,19 +103,10 @@ final class Parser {
 				continue;
 			}
 
-			$value = ltrim( $value );
+			$value  = ltrim( $value );
+			$quoted = self::opens_quote( $value ) ? self::quoted( $value, $lines, $i ) : null;
 
-			// A value opening with a quote may continue over several lines —
-			// a pasted private key is the reason this exists.
-			if ( self::opens_quote( $value ) ) {
-				$quote = $value[0];
-
-				while ( ! self::closes_quote( $value, $quote ) && $i + 1 < $total ) {
-					$value .= "\n" . $lines[ ++$i ];
-				}
-			}
-
-			$values[ $key ] = self::clean( $value );
+			$values[ $key ] = $quoted ?? self::unquoted( $value );
 		}
 
 		return $values;
@@ -97,7 +122,7 @@ final class Parser {
 	 * @return bool
 	 */
 	private static function is_valid_key( string $key ): bool {
-		return 1 === preg_match( '/^[A-Za-z_][A-Za-z0-9_]*$/', $key );
+		return 1 === preg_match( '/^[A-Za-z_][A-Za-z0-9_]*$/D', $key );
 	}
 
 	/**
@@ -114,58 +139,98 @@ final class Parser {
 	}
 
 	/**
-	 * Does this value close the quote it opened with?
+	 * Read a quoted value, following it over as many lines as it takes.
 	 *
-	 * @since 1.0.0
+	 * The value ends at the first closing quote that is not escaped, and
+	 * anything after it on that line — a comment, usually — is ignored. A
+	 * pasted private key is the reason this reads across lines at all.
 	 *
-	 * @param string $value Raw value, possibly spanning lines.
-	 * @param string $quote The opening quote character.
+	 * A quote that never closes is not a quoted value: it is a value that
+	 * happens to begin with a quote, so this returns null and leaves `$i`
+	 * alone. Reading to the end of the file instead would swallow every key
+	 * after it — a `DEBUG=false` among them — without a word.
 	 *
-	 * @return bool
+	 * @since 1.1.0
+	 *
+	 * @param string             $value The value as it appears on its first line.
+	 * @param array<int, string> $lines Every line of the file.
+	 * @param int                $i     Index of the current line; moved to the
+	 *                                  line the value ends on.
+	 *
+	 * @return string|null The unquoted value, or null when the quote never closes.
 	 */
-	private static function closes_quote( string $value, string $quote ): bool {
-		if ( strlen( $value ) < 2 ) {
-			return false;
-		}
+	private static function quoted( #[\SensitiveParameter] string $value, array $lines, int &$i ): ?string {
+		$quote = $value[0];
+		$body  = substr( $value, 1 );
+		$from  = 0;
+		$line  = $i;
+		$total = count( $lines );
 
-		// An escaped quote does not close the value.
-		return str_ends_with( $value, $quote ) && ! str_ends_with( $value, '\\' . $quote );
+		while ( true ) {
+			$end = self::closing( $body, $quote, $from );
+
+			if ( null !== $end ) {
+				$i     = $line;
+				$value = substr( $body, 0, $end );
+
+				// Escapes only mean anything inside double quotes, which is
+				// how every shell behaves and what people expect.
+				return '"' === $quote ? strtr( $value, self::ESCAPES ) : $value;
+			}
+
+			if ( $line + 1 >= $total ) {
+				return null;
+			}
+
+			$from  = strlen( $body ) + 1;
+			$body .= "\n" . $lines[ ++$line ];
+		}
 	}
 
 	/**
-	 * Strip quotes and trailing comments, and expand escapes.
+	 * Where the closing quote is, if there is one.
 	 *
-	 * @since 1.0.0
+	 * Inside double quotes a backslash escapes the next character, so `\"`
+	 * does not close the value and `\\"` does. Single quotes have no escapes.
+	 *
+	 * @since 1.1.0
+	 *
+	 * @param string $body  The value after its opening quote.
+	 * @param string $quote The opening quote character.
+	 * @param int    $from  Offset to start looking from.
+	 *
+	 * @return int|null Offset of the closing quote, or null when there is none.
+	 */
+	private static function closing( #[\SensitiveParameter] string $body, string $quote, int $from ): ?int {
+		$length = strlen( $body );
+
+		for ( $at = $from; $at < $length; $at++ ) {
+			if ( '"' === $quote && '\\' === $body[ $at ] ) {
+				++$at;
+				continue;
+			}
+
+			if ( $quote === $body[ $at ] ) {
+				return $at;
+			}
+		}
+
+		return null;
+	}
+
+	/**
+	 * Strip a trailing comment from an unquoted value.
+	 *
+	 * A `#` starts a comment only with space before it — otherwise a
+	 * password containing one would be truncated.
+	 *
+	 * @since 1.1.0
 	 *
 	 * @param string $value Raw value.
 	 *
 	 * @return string
 	 */
-	private static function clean( string $value ): string {
-		if ( self::opens_quote( $value ) ) {
-			$quote = $value[0];
-
-			if ( self::closes_quote( $value, $quote ) ) {
-				$value = substr( $value, 1, -1 );
-			} else {
-				$value = substr( $value, 1 );
-			}
-
-			// Escapes only mean anything inside double quotes, which is how
-			// every shell behaves and what people expect.
-			if ( '"' === $quote ) {
-				$value = str_replace(
-					array( '\\n', '\\r', '\\t', '\\"', '\\\\' ),
-					array( "\n", "\r", "\t", '"', '\\' ),
-					$value
-				);
-			}
-
-			return $value;
-		}
-
-		// Unquoted: a `#` starts a comment, but only with space before it —
-		// otherwise a password containing one would be truncated.
+	private static function unquoted( #[\SensitiveParameter] string $value ): string {
 		$value = preg_replace( '/\s+#.*$/', '', $value ) ?? $value;
 
 		return trim( $value );

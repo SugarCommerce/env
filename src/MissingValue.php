@@ -26,6 +26,8 @@ use RuntimeException;
 final class MissingValue extends RuntimeException {
 
 	/**
+	 * Name the key, and only the key — never a value.
+	 *
 	 * @since 1.0.0
 	 *
 	 * @param string $key The name that was missing.
